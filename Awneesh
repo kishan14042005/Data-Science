@@ -1,0 +1,519 @@
+# Data Science Practicals — Code Collection
+
+This document contains runnable code snippets, configuration files and instructions to cover the practicals listed in your screenshot. Each section is a standalone script or small set of files. Use a virtual environment and install `requirements.txt` before running.
+
+---
+
+## requirements.txt
+
+```
+pandas
+numpy
+sqlalchemy
+mysql-connector-python
+cassandra-driver
+pillow
+mutagen
+ffmpeg-python
+python-dateutil
+matplotlib
+pyarrow
+fastparquet
+pytest
+psutil
+```
+
+> Install with: `python -m pip install -r requirements.txt`
+
+---
+
+## 0_prerequisites.md
+
+* Python 3.9+ installed
+* Java and Cassandra (3.x or 4.x) installed for Practical 1 (or use Docker image `cassandra:4.0`)
+* ffmpeg installed on PATH (for video/audio operations)
+* MySQL server if you want to test MySQL extraction
+* Create a virtualenv and install `requirements.txt`
+
+---
+
+## 1_cassandra_setup.cql
+
+```sql
+-- Create keyspace and a sample table to hold IoT-like records
+CREATE KEYSPACE IF NOT EXISTS ds_practical WITH replication = {'class': 'SimpleStrategy', 'replication_factor': '1'};
+
+CREATE TABLE IF NOT EXISTS ds_practical.events (
+    device_id text,
+    event_ts timestamp,
+    event_type text,
+    payload map<text,text>,
+    PRIMARY KEY ((device_id), event_ts)
+) WITH CLUSTERING ORDER BY (event_ts DESC);
+```
+
+---
+
+## 1_ingest_cassandra.py
+
+```python
+# Ingest sample CSV into Cassandra
+from cassandra.cluster import Cluster
+import pandas as pd
+from dateutil import parser
+
+CSV_PATH = 'sample_events.csv'
+
+def main():
+    df = pd.read_csv(CSV_PATH)
+    cluster = Cluster(['127.0.0.1'])
+    session = cluster.connect('ds_practical')
+    insert_cql = """
+    INSERT INTO events (device_id, event_ts, event_type, payload) VALUES (?, ?, ?, ?)
+    """
+    prepared = session.prepare(insert_cql)
+    for _, row in df.iterrows():
+        device_id = str(row['device_id'])
+        ts = parser.parse(row['event_ts'])
+        event_type = str(row.get('event_type',''))
+        payload = {k: str(v) for k, v in row.items() if k not in ('device_id','event_ts','event_type')}
+        session.execute(prepared, (device_id, ts, event_type, payload))
+    print('Done')
+
+if __name__ == '__main__':
+    main()
+```
+
+---
+
+## 2_convert_csv_to_hours.py
+
+```python
+# Convert CSV timestamps or date fields into HOURS format (HH:MM:SS and fractional hours)
+import pandas as pd
+from dateutil import parser
+
+IN = 'data_input.csv'
+OUT = 'data_input_hours.csv'
+
+def to_hours(ts):
+    # ts: datetime-like
+    h = ts.hour
+    m = ts.minute
+    s = ts.second
+    hhmmss = f"{h:02d}:{m:02d}:{s:02d}"
+    fractional = h + m/60.0 + s/3600.0
+    return hhmmss, fractional
+
+if __name__ == '__main__':
+    df = pd.read_csv(IN)
+    # Try to detect a timestamp column; common names
+    candidates = [c for c in df.columns if 'time' in c.lower() or 'date' in c.lower()]
+    if not candidates:
+        raise SystemExit('No timestamp-like column found')
+    ts_col = candidates[0]
+    df[ts_col] = pd.to_datetime(df[ts_col], errors='coerce')
+    df['HOUR_HHMMSS'] = df[ts_col].apply(lambda x: to_hours(x)[0] if pd.notnull(x) else '')
+    df['HOUR_FRACTION'] = df[ts_col].apply(lambda x: to_hours(x)[1] if pd.notnull(x) else None)
+    df.to_csv(OUT, index=False)
+    print(f'Wrote {OUT}')
+```
+
+---
+
+## 2_convert_xml_to_hours.py
+
+```python
+# Parse XML input and convert timestamp nodes to HOURS
+import xml.etree.ElementTree as ET
+from dateutil import parser
+
+IN = 'data_input.xml'
+OUT = 'data_input_hours.xml'
+
+def to_hhmmss_fraction(ts):
+    h = ts.hour; m = ts.minute; s = ts.second
+    return f"{h:02d}:{m:02d}:{s:02d}", h + m/60.0 + s/3600.0
+
+if __name__ == '__main__':
+    tree = ET.parse(IN)
+    root = tree.getroot()
+    for node in root.iter():
+        # common attribute or element named 'timestamp' or 'time' convert it
+        if node.tag.lower().endswith('timestamp') or node.tag.lower().endswith('time'):
+            try:
+                ts = parser.parse(node.text)
+                hh, frac = to_hhmmss_fraction(ts)
+                node.set('hours_hhmmss', hh)
+                node.set('hours_fraction', str(frac))
+            except Exception:
+                continue
+    tree.write(OUT, encoding='utf-8')
+    print('Wrote', OUT)
+```
+
+---
+
+## 2_convert_json_to_hours.py
+
+```python
+# Traverse JSON and convert fields that look like timestamps
+import json
+from dateutil import parser
+
+IN = 'data.json'
+OUT = 'data_hours.json'
+
+
+def try_parse_and_convert(v):
+    try:
+        ts = parser.parse(v)
+        hh = f"{ts.hour:02d}:{ts.minute:02d}:{ts.second:02d}"
+        frac = ts.hour + ts.minute/60.0 + ts.second/3600.0
+        return {'original': v, 'hours_hhmmss': hh, 'hours_fraction': frac}
+    except Exception:
+        return v
+
+
+def walk(o):
+    if isinstance(o, dict):
+        return {k: walk(v) for k, v in o.items()}
+    if isinstance(o, list):
+        return [walk(x) for x in o]
+    if isinstance(o, str):
+        return try_parse_and_convert(o)
+    return o
+
+if __name__ == '__main__':
+    with open(IN) as f:
+        data = json.load(f)
+    out = walk(data)
+    with open(OUT, 'w') as f:
+        json.dump(out, f, indent=2, default=str)
+    print('Wrote', OUT)
+```
+
+---
+
+## 2_mysql_to_hours.py
+
+```python
+# Read from MySQL, convert timestamp columns to HOURS and write CSV
+import pandas as pd
+from sqlalchemy import create_engine
+
+MYSQL_URI = 'mysql+mysqlconnector://user:password@localhost:3306/testdb'
+QUERY = 'SELECT * FROM events LIMIT 1000'
+OUT = 'mysql_events_hours.csv'
+
+if __name__ == '__main__':
+    engine = create_engine(MYSQL_URI)
+    df = pd.read_sql(QUERY, engine)
+    # convert all datetime columns
+    for c in df.select_dtypes(include=['datetime64[ns]']).columns:
+        df[c + '_HOUR_HHMMSS'] = df[c].dt.strftime('%H:%M:%S')
+        df[c + '_HOUR_FRACTION'] = df[c].dt.hour + df[c].dt.minute/60 + df[c].dt.second/3600
+    df.to_csv(OUT, index=False)
+    print('Wrote', OUT)
+```
+
+---
+
+## 2_image_to_hours.py
+
+```python
+# Extract image EXIF timestamp and convert to hours (if available)
+from PIL import Image
+from PIL.ExifTags import TAGS
+from dateutil import parser
+import os
+
+IN_DIR = 'images'
+OUT = 'images_hours.csv'
+
+
+def get_exif(img):
+    exif = img._getexif()
+    if not exif:
+        return {}
+    return {TAGS.get(k, k): v for k, v in exif.items()}
+
+if __name__ == '__main__':
+    import csv
+    rows = []
+    for fn in os.listdir(IN_DIR):
+        path = os.path.join(IN_DIR, fn)
+        try:
+            im = Image.open(path)
+            ex = get_exif(im)
+            dt = ex.get('DateTimeOriginal') or ex.get('DateTime')
+            if dt:
+                ts = parser.parse(dt)
+                hh = f"{ts.hour:02d}:{ts.minute:02d}:{ts.second:02d}"
+                frac = ts.hour + ts.minute/60 + ts.second/3600
+            else:
+                hh, frac = '', ''
+            rows.append({'file': fn, 'hours_hhmmss': hh, 'hours_fraction': frac})
+        except Exception as e:
+            rows.append({'file': fn, 'hours_hhmmss': '', 'hours_fraction': '', 'error': str(e)})
+    with open(OUT, 'w', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=rows[0].keys())
+        writer.writeheader()
+        writer.writerows(rows)
+    print('Wrote', OUT)
+```
+
+---
+
+## 2_video_audio_to_hours.py
+
+```python
+# Use ffprobe/ffmpeg (via ffmpeg-python) to get media duration, start time, and convert to hours
+import subprocess
+import json
+import os
+from dateutil import parser
+
+IN_DIR = 'media'
+OUT = 'media_hours.csv'
+
+
+def ffprobe_json(path):
+    cmd = ['ffprobe', '-v', 'quiet', '-print_format', 'json', '-show_format', '-show_streams', path]
+    p = subprocess.run(cmd, capture_output=True, text=True)
+    return json.loads(p.stdout)
+
+if __name__ == '__main__':
+    import csv
+    rows = []
+    for fn in os.listdir(IN_DIR):
+        path = os.path.join(IN_DIR, fn)
+        try:
+            info = ffprobe_json(path)
+            duration = float(info['format']['duration']) if 'duration' in info['format'] else None
+            # there may not be a creation_time; try to read from tags
+            tags = info['format'].get('tags', {})
+            creation = tags.get('creation_time')
+            if creation:
+                ts = parser.parse(creation)
+                hh = f"{ts.hour:02d}:{ts.minute:02d}:{ts.second:02d}"
+                frac = ts.hour + ts.minute/60 + ts.second/3600
+            else:
+                hh, frac = '', ''
+            rows.append({'file': fn, 'duration_seconds': duration, 'creation_hhmmss': hh, 'creation_fraction': frac})
+        except Exception as e:
+            rows.append({'file': fn, 'error': str(e)})
+    with open(OUT, 'w', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=rows[0].keys())
+        writer.writeheader()
+        writer.writerows(rows)
+    print('Wrote', OUT)
+```
+
+---
+
+## 3_utilities_auditing.py
+
+```python
+# Small utility: checksum, schema audit and logging
+import hashlib
+import json
+import os
+import pandas as pd
+
+
+def file_md5(path):
+    h = hashlib.md5()
+    with open(path, 'rb') as f:
+        for chunk in iter(lambda: f.read(8192), b''):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def schema_audit_csv(path):
+    df = pd.read_csv(path, nrows=10)
+    return {col: str(dtype) for col, dtype in df.dtypes.items()}
+
+if __name__ == '__main__':
+    import argparse
+    p = argparse.ArgumentParser()
+    p.add_argument('file')
+    args = p.parse_args()
+    print('md5:', file_md5(args.file))
+    if args.file.endswith('.csv'):
+        print('schema sample:', schema_audit_csv(args.file))
+```
+
+---
+
+## 4_retrieving_data.py
+
+```python
+# Example: retrieve from Cassandra and MySQL and show sample rows
+from cassandra.cluster import Cluster
+from sqlalchemy import create_engine
+import pandas as pd
+
+
+def cassandra_sample():
+    cluster = Cluster(['127.0.0.1'])
+    session = cluster.connect('ds_practical')
+    rows = session.execute('SELECT device_id, event_ts, event_type FROM events LIMIT 20')
+    return pd.DataFrame(rows)
+
+
+def mysql_sample(uri):
+    engine = create_engine(uri)
+    return pd.read_sql('SELECT * FROM events LIMIT 20', engine)
+
+if __name__ == '__main__':
+    print(cassandra_sample().head())
+    # print(mysql_sample('mysql+mysqlconnector://user:pass@localhost/testdb').head())
+```
+
+---
+
+## 5_assessing_data.py
+
+```python
+# Basic data assessment: missing values, types, simple stats
+import pandas as pd
+
+IN = 'data_input_hours.csv'
+
+if __name__ == '__main__':
+    df = pd.read_csv(IN)
+    print('shape', df.shape)
+    print('dtypes', df.dtypes)
+    print('missing', df.isna().sum())
+    print('describe', df.describe(include='all'))
+```
+
+---
+
+## 6_processing_data.py
+
+```python
+# Cleaning: drop duplicates, impute, normalize numeric features
+import pandas as pd
+from sklearn.impute import SimpleImputer
+from sklearn.preprocessing import StandardScaler
+
+IN = 'data_input_hours.csv'
+OUT = 'data_processed.parquet'
+
+if __name__ == '__main__':
+    df = pd.read_csv(IN)
+    df = df.drop_duplicates()
+    # numeric columns
+    nums = df.select_dtypes(include=['number']).columns.tolist()
+    if nums:
+        imputer = SimpleImputer(strategy='median')
+        df[nums] = imputer.fit_transform(df[nums])
+        scaler = StandardScaler()
+        df[nums] = scaler.fit_transform(df[nums])
+    df.to_parquet(OUT)
+    print('Wrote', OUT)
+```
+
+---
+
+## 7_transforming_data.py
+
+```python
+# Feature engineering: one-hot categorical, datetime features
+import pandas as pd
+
+IN = 'data_processed.parquet'
+OUT = 'data_transformed.parquet'
+
+if __name__ == '__main__':
+    df = pd.read_parquet(IN)
+    # extract hour from HOUR_HHMMSS
+    if 'HOUR_HHMMSS' in df.columns:
+        df['hour'] = pd.to_datetime(df['HOUR_HHMMSS'], format='%H:%M:%S', errors='coerce').dt.hour
+    # one-hot encode small cardinality categorical fields
+    cat_cols = [c for c in df.columns if df[c].dtype == 'object' and df[c].nunique() < 50]
+    df = pd.get_dummies(df, columns=cat_cols, dummy_na=True)
+    df.to_parquet(OUT)
+    print('Wrote', OUT)
+```
+
+---
+
+## 8_organizing_data.py
+
+```python
+# Save datasets partitioned by date/hour (Parquet) and create manifest
+import pandas as pd
+import os
+
+IN = 'data_transformed.parquet'
+OUT_DIR = 'data_warehouse'
+
+if __name__ == '__main__':
+    df = pd.read_parquet(IN)
+    # require a date column called 'event_ts' or 'date'
+    if 'event_ts' in df.columns:
+        df['date'] = pd.to_datetime(df['event_ts']).dt.date
+    else:
+        df['date'] = pd.Timestamp.now().date()
+    os.makedirs(OUT_DIR, exist_ok=True)
+    for d, group in df.groupby('date'):
+        path = os.path.join(OUT_DIR, f'date={d}')
+        os.makedirs(path, exist_ok=True)
+        fn = os.path.join(path, 'part.parquet')
+        group.to_parquet(fn, index=False)
+    print('Partitioned and wrote to', OUT_DIR)
+```
+
+---
+
+## 9_generate_reports.py
+
+```python
+# Small reporting: produce a PDF/PNG chart and basic summary CSV
+import pandas as pd
+import matplotlib.pyplot as plt
+
+IN = 'data_transformed.parquet'
+OUT_SUM = 'report_summary.csv'
+OUT_PLOT = 'report_plot.png'
+
+if __name__ == '__main__':
+    df = pd.read_parquet(IN)
+    summary = df.describe(include='all')
+    summary.to_csv(OUT_SUM)
+    # example plot: count per hour
+    if 'hour' in df.columns:
+        counts = df['hour'].value_counts().sort_index()
+        counts.plot(kind='bar')
+        plt.xlabel('hour of day')
+        plt.ylabel('count')
+        plt.tight_layout()
+        plt.savefig(OUT_PLOT)
+    print('Wrote', OUT_SUM, 'and', OUT_PLOT)
+```
+
+---
+
+## 10_power_bi_instructions.md
+
+1. Open Power BI Desktop.
+2. `Get Data` → `Text/CSV` or `Folder` and point to the CSVs / Parquet files you produced.
+3. Use `Transform Data` to adjust columns, types, and create visualizations.
+4. For large Parquet partitions, use `Get Data` → `Folder` and combine files.
+5. Publish to Power BI Service if desired.
+
+---
+
+## Tests and utilities
+
+* `pytest` can be used to write small unit tests for helper functions. Example test files omitted for brevity.
+
+---
+
+### Final notes
+
+* Replace placeholder credentials, paths and hostnames with your environment values.
+* Scripts are intentionally simple and educational — adjust for production (error handling, batching, logging, secrets management).
